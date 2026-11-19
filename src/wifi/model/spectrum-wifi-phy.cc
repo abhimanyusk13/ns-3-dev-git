@@ -29,6 +29,7 @@
 #include "ns3/spectrum-channel.h"
 
 #include <algorithm>
+#include <memory>
 #include <numeric>
 
 #undef NS_LOG_APPEND_CONTEXT
@@ -552,13 +553,30 @@ SpectrumWifiPhy::StartRx(Ptr<SpectrumSignalParameters> rxParams,
         const auto& ruBands =
             interface ? interface->GetRuBands() : m_currentSpectrumPhyInterface->GetRuBands();
         NS_ASSERT(!ruBands.empty());
+        RxPowerWattPerChannelBand::container_type mergedPowers;
+        mergedPowers.reserve(rxPowers.size() + ruBands.size());
+        auto channelPower = rxPowers.cbegin();
         for (const auto& band : ruBands)
         {
             auto rxPowerPerBand =
                 WifiSpectrumValueHelper::GetBandPowerW(receivedSignalPsd, band.indices);
             rxPowerPerBand *= rxGainRatio;
-            rxPowers.insert({band, rxPowerPerBand});
+            while (channelPower != rxPowers.cend() && channelPower->first < band)
+            {
+                mergedPowers.push_back(*channelPower++);
+            }
+            if (channelPower != rxPowers.cend() && !(band < channelPower->first))
+            {
+                // Channel bands precede RU bands when their keys are equivalent.
+                mergedPowers.push_back(*channelPower++);
+            }
+            else
+            {
+                mergedPowers.emplace_back(band, rxPowerPerBand);
+            }
         }
+        mergedPowers.insert(mergedPowers.end(), channelPower, rxPowers.cend());
+        rxPowers = RxPowerWattPerChannelBand(std::move(mergedPowers));
     }
 
     NS_ASSERT_MSG(totalRxPower >= Watt_u{0.0}, "Negative RX power");
@@ -635,10 +653,12 @@ SpectrumWifiPhy::StartRx(Ptr<SpectrumSignalParameters> rxParams,
 
     NS_LOG_INFO("Received Wi-Fi signal");
     // Use ScheduleNow so StartReceivePreamble runs after all cleanup callbacks
-    // Capture by value to avoid dangling references after this function returns
-    Simulator::ScheduleNow([this, ppdu, rxPowers, rxDuration]() mutable {
-        StartReceivePreamble(ppdu, rxPowers, rxDuration);
-    });
+    // Share the reception state across callable copies until the callback runs.
+    Simulator::ScheduleNow(
+        [this,
+         ppdu,
+         rxPowers = std::make_shared<RxPowerWattPerChannelBand>(std::move(rxPowers)),
+         rxDuration]() { StartReceivePreamble(ppdu, *rxPowers, rxDuration); });
 }
 
 Ptr<const WifiPpdu>

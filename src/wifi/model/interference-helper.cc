@@ -131,7 +131,7 @@ operator<<(std::ostream& os, const Event& event)
 
 InterferenceHelper::NiChange::NiChange(Watt_u power, Ptr<Event> event)
     : m_power(power),
-      m_event(event)
+      m_event(std::move(event))
 {
 }
 
@@ -336,21 +336,46 @@ InterferenceHelper::AppendEvent(Ptr<Event> event,
                                 bool isStartHePortionRxing)
 {
     NS_LOG_FUNCTION(this << event << freqRange << isStartHePortionRxing);
-    for (const auto& [band, power] : event->GetRxPowerPerBand())
+    const auto& rxPowers = event->GetRxPowerPerBand();
+    const auto rxingIt = m_rxing.find(freqRange);
+    const bool rxing = rxingIt != m_rxing.end() && rxingIt->second;
+    // A dense sorted subset permits a traversal bounded by twice its size.
+    // Sparse subsets retain logarithmic lookups into unrelated interface bands.
+    const bool useOrderedLookup = rxPowers.size() > m_bandStates.size() / 2;
+    auto nextBandIt = m_bandStates.begin();
+    for (const auto& [band, power] : rxPowers)
     {
-        auto bandIt = m_bandStates.find(band);
+        auto bandIt = m_bandStates.end();
+        if (useOrderedLookup)
+        {
+            while (nextBandIt != m_bandStates.end() && nextBandIt->first < band)
+            {
+                ++nextBandIt;
+            }
+            if (nextBandIt != m_bandStates.end() && !(band < nextBandIt->first))
+            {
+                bandIt = nextBandIt++;
+            }
+        }
+        else
+        {
+            bandIt = m_bandStates.find(band);
+        }
         NS_ABORT_IF(bandIt == m_bandStates.end());
         auto& niChanges = bandIt->second.niChanges;
-        Watt_u previousPowerStart{0.0};
-        Watt_u previousPowerEnd{0.0};
-        auto previousPowerPosition = GetPreviousPosition(event->GetStartTime(), bandIt);
-        previousPowerStart = previousPowerPosition->second.GetPower();
-        previousPowerEnd = GetPreviousPosition(event->GetEndTime(), bandIt)->second.GetPower();
-        if (const auto rxing = (m_rxing.contains(freqRange) && m_rxing.at(freqRange)); !rxing)
+        const auto startPosition = niChanges.upper_bound(event->GetStartTime());
+        const auto endPosition = niChanges.upper_bound(event->GetEndTime());
+        const auto previousPowerStart = std::prev(startPosition)->second.GetPower();
+        const auto previousPowerEnd = std::prev(endPosition)->second.GetPower();
+        auto firstIdx = std::distance(niChanges.begin(), startPosition);
+        auto lastIdx = std::distance(niChanges.begin(), endPosition);
+        if (!rxing)
         {
             bandIt->second.firstPower = previousPowerStart;
             // Always leave the first zero power noise event in the list
-            niChanges.erase(++(niChanges.begin()), ++previousPowerPosition);
+            niChanges.erase(std::next(niChanges.begin()), startPosition);
+            lastIdx -= firstIdx - 1;
+            firstIdx = 1;
         }
         else if (isStartHePortionRxing)
         {
@@ -359,16 +384,13 @@ InterferenceHelper::AppendEvent(Ptr<Event> event,
             // HE TB PPDU transmission and the start of HE TB payload.
             bandIt->second.firstPower = previousPowerStart;
         }
-        // With NiChanges backed by a sorted vector, a second insert may invalidate the
-        // iterator returned by the first. Capture both insert positions as indices --
-        // since GetStartTime() <= GetEndTime(), the second insert lands at an index
-        // >= the first, so the first index remains stable across the second insert.
-        const auto firstIt =
-            AddNiChangeEvent(event->GetStartTime(), NiChange(previousPowerStart, event), bandIt);
-        const auto firstIdx = std::distance(niChanges.begin(), firstIt);
-        const auto lastIt =
-            AddNiChangeEvent(event->GetEndTime(), NiChange(previousPowerEnd, event), bandIt);
-        const auto lastIdx = std::distance(niChanges.begin(), lastIt);
+        // Indices survive vector reallocations. The start insertion precedes the end
+        // insertion, including when both endpoints have the same timestamp.
+        niChanges.insert(niChanges.begin() + firstIdx,
+                         {event->GetStartTime(), NiChange(previousPowerStart, event)});
+        ++lastIdx;
+        niChanges.insert(niChanges.begin() + lastIdx,
+                         {event->GetEndTime(), NiChange(previousPowerEnd, event)});
         for (auto i = firstIdx; i != lastIdx; ++i)
         {
             niChanges.at(i).second.AddPower(power);
@@ -803,7 +825,8 @@ InterferenceHelper::AddNiChangeEvent(const Time& moment,
                                      NiChange change,
                                      BandStateMap::iterator bandIt)
 {
-    return bandIt->second.niChanges.insert(GetNextPosition(moment, bandIt), {moment, change});
+    return bandIt->second.niChanges.insert(GetNextPosition(moment, bandIt),
+                                           {moment, std::move(change)});
 }
 
 void

@@ -260,6 +260,24 @@ class RxPowerWattPerChannelBand
     using const_iterator = container_type::const_iterator;      //!< const iterator type
     using size_type = std::size_t;                              //!< size type
 
+    /// Construct an empty collection.
+    RxPowerWattPerChannelBand() = default;
+
+    /**
+     * Take ownership of entries with strictly increasing band keys.
+     * @param entries entries sorted by band, with no equivalent keys
+     */
+    explicit RxPowerWattPerChannelBand(container_type&& entries)
+        : m_data(std::move(entries))
+    {
+        NS_ASSERT_MSG(std::adjacent_find(m_data.cbegin(),
+                                         m_data.cend(),
+                                         [](const auto& lhs, const auto& rhs) {
+                                             return !(lhs.first < rhs.first);
+                                         }) == m_data.cend(),
+                      "Received power entries must have strictly increasing band keys");
+    }
+
     /// @return an iterator to the first entry
     iterator begin()
     {
